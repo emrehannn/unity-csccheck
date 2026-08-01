@@ -1,0 +1,869 @@
+#!/usr/bin/env python3
+"""
+unity-csccheck — offline, per-assembly C# compile check for Unity projects.
+
+WHY THIS EXISTS
+    An open Unity editor holds Temp/UnityLockfile, and *every* `-batchmode`
+    invocation fails against it — a hard lock, not a race. So there is no way to
+    ask "does my C# compile?" while the editor is open, which is exactly when you
+    need it (during Play mode, or while several agents write files in parallel).
+
+    This tool never launches Unity and never touches the lockfile. It compiles
+    each assembly with Unity's own bundled Roslyn (mono `csc.exe`) using the
+    exact reference set, defines, langversion and unsafe flag that Unity itself
+    recorded in the generated `*.csproj`.
+
+WHY PER-ASSEMBLY
+    One flat reference set cannot serve a whole project. A DOTS runtime assembly
+    is netstandard2.1 and needs `NetStandard/ref/2.1.0/netstandard.dll` for the
+    default-interface-members that `ISystem` uses (otherwise: CS8702). A net472
+    NUnit test assembly needs `UnityReferenceAssemblies/unity-4.8-api/mscorlib.dll`
+    and blows up with CS0433 (`HashSet<T> exists in both ...`) the moment you put
+    netstandard 2.1 in front of it. Unity already solved this per assembly; the
+    csproj files are that solution written down. We just replay them.
+
+    Compiling per assembly also catches a class of bug a whole-project compile
+    structurally cannot see: **assembly-boundary violations**. Code in one
+    assembly using a type from another whose .asmdef does not reference it
+    compiles fine when every source is thrown into one csc invocation, then
+    fails the moment Unity compiles the real graph. Here it fails immediately,
+    in the assembly that owns it.
+
+    What it does NOT catch, contrary to a common assumption: an unguarded
+    `using UnityEditor;` in a runtime assembly. Measured, not assumed — Unity's
+    own generated csproj for a *runtime* asmdef carries 67 UnityEditor
+    references, because editor-time compilation has to accept `#if UNITY_EDITOR`
+    code. Unity itself only rejects that at player-build time, when UnityEditor
+    is stripped. Replaying the csproj faithfully means inheriting that leniency.
+    Catching it would need a separate player-profile compile, which this tool
+    does not do.
+
+REQUIREMENTS
+    - Unity installed (auto-detected from the csproj HintPaths; `UNITY_ROOT` overrides).
+    - `Library/ScriptAssemblies/` populated — the project must have been opened in
+      Unity at least once, and the `*.csproj` files must exist.
+    - Python 3.8+. Standard library only. Runs entirely offline.
+
+EXIT CODES
+    0  every selected assembly compiled
+    1  at least one compile error
+    2  tool / setup problem
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+VERSION = "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Known-noise diagnostics.
+#
+# These are passed to csc as `-nowarn:`, which by construction can only suppress
+# WARNINGS — the compiler will not let you silence an error this way. So this
+# list can never hide a real failure; the worst it can do is hide a warning.
+#
+#   CS0169 / CS0414 / CS0649  fields Unity assigns from the inspector, so Roslyn
+#                             thinks they are unused / never written.
+#   CS0436  "type conflicts with the imported type ... in Assembly-CSharp".
+#           Expected and unavoidable here: we reference
+#           Library/ScriptAssemblies/*.dll, which contains Unity's own already-
+#           compiled copy of the very source we are recompiling. Unity does not
+#           hit this because it compiles a clean graph. Not a defect.
+#   CS1701 / CS1702  assembly-version unification chatter from the reference set.
+#   CS8632  nullable annotations in a non-nullable context.
+# ---------------------------------------------------------------------------
+NOISE_WARNINGS = ["0169", "0414", "0436", "0649", "1701", "1702", "8632"]
+
+DIAG_RE = re.compile(r":\s*(error|warning)\s+([A-Z]+\d+)\s*:")
+
+
+def die(msg: str) -> "None":
+    sys.stderr.write(f"unity-csccheck: {msg}\n")
+    raise SystemExit(2)
+
+
+# ---------------------------------------------------------------------------
+# csproj model
+# ---------------------------------------------------------------------------
+
+
+def _tag(el) -> str:
+    """Local tag name, namespace-agnostic (Unity emits no xmlns, but be safe)."""
+    return el.tag.rpartition("}")[2]
+
+
+class Assembly:
+    def __init__(self, csproj: Path, project: Path):
+        self.csproj = csproj
+        self.project = project
+        self.name = csproj.stem
+        self.lang_version = "9.0"
+        self.unsafe = False
+        self.defines: list[str] = []
+        self.nowarn: list[str] = []
+        self.sources: list[Path] = []
+        self.declared_sources: list[str] = []
+        self.missing_sources: list[str] = []
+        self.hint_paths: list[str] = []
+        self.project_refs: list[str] = []
+        self.added_from_disk = 0
+        self.borrowed_from: "str | None" = None
+        self._parse()
+
+    def _abs(self, raw: str) -> Path:
+        p = Path(raw.replace("\\", "/"))
+        return p if p.is_absolute() else (self.project / p)
+
+    def _parse(self) -> None:
+        try:
+            # utf-8-sig: Unity writes a BOM. ElementTree already un-escapes
+            # &amp; / &apos; etc. for us, so paths with '&' come out intact.
+            text = self.csproj.read_text(encoding="utf-8-sig")
+            root = ET.fromstring(text)
+        except (OSError, ET.ParseError) as exc:
+            die(f"cannot parse {self.csproj.name}: {exc}")
+
+        for el in root.iter():
+            t = _tag(el)
+            if t == "AssemblyName" and el.text:
+                self.name = el.text.strip()
+            elif t == "LangVersion" and el.text:
+                self.lang_version = el.text.strip()
+            elif t == "AllowUnsafeBlocks" and el.text:
+                self.unsafe = el.text.strip().lower() == "true"
+            elif t == "DefineConstants" and el.text:
+                self.defines = [d for d in el.text.strip().split(";") if d]
+            elif t == "NoWarn" and el.text:
+                self.nowarn = [
+                    # csc wants bare numbers or full codes; Unity mixes in
+                    # analyzer ids like USG0001 which csc rejects outright.
+                    n for n in el.text.strip().split(";") if n and n[0].isdigit()
+                ]
+            elif t == "Compile":
+                inc = el.get("Include")
+                if inc:
+                    p = self._abs(inc)
+                    # Stale csproj entries are common when files move outside the
+                    # editor. Skip them rather than failing the whole assembly.
+                    self.declared_sources.append(inc.replace("\\", "/"))
+                    if p.is_file():
+                        self.sources.append(p)
+                    else:
+                        self.missing_sources.append(inc)
+            elif t == "HintPath" and el.text:
+                self.hint_paths.append(el.text.strip())
+            elif t == "ProjectReference":
+                inc = el.get("Include")
+                if inc:
+                    self.project_refs.append(Path(inc.replace("\\", "/")).stem)
+
+    # -- classification -----------------------------------------------------
+
+    def source_scope(self) -> str:
+        """'assets', 'packages' (embedded/local) or 'cache' (immutable PackageCache).
+
+        Classified from the csproj's declared paths, not the ones that survive the
+        exists-on-disk filter — an assembly whose sources have all been deleted
+        still belongs where the csproj says it does.
+        """
+        rels = self.declared_sources
+        if any(r.startswith("Assets/") for r in rels):
+            return "assets"
+        if any(r.startswith("Library/PackageCache/") for r in rels):
+            return "cache"
+        if any(r.startswith("Packages/") for r in rels):
+            return "packages"
+        return "assets" if not rels else "packages"
+
+    def is_editor_only(self) -> bool:
+        return "UNITY_EDITOR_ONLY_COMPILATION" in self.defines
+
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+
+def find_project(arg: "str | None") -> Path:
+    start = Path(arg).resolve() if arg else Path.cwd()
+    if not start.is_dir():
+        die(f"not a directory: {start}")
+    for cand in [start, *start.parents]:
+        if (cand / "ProjectSettings" / "ProjectVersion.txt").is_file():
+            return cand
+    die(
+        f"{start} is not a Unity project (no ProjectSettings/ProjectVersion.txt "
+        "here or in any parent)"
+    )
+
+
+def load_assemblies(project: Path) -> list[Assembly]:
+    csprojs = sorted(project.glob("*.csproj"))
+    if not csprojs:
+        die(
+            f"no *.csproj in {project} — Unity generates them on open. Open the "
+            "project in Unity once (or enable Preferences > External Tools > "
+            "Generate .csproj files)."
+        )
+    return [Assembly(c, project) for c in csprojs]
+
+
+def merge_discovered(assemblies: list[Assembly], project: Path) -> tuple[list[Assembly], list[str]]:
+    """Fold on-disk assembly membership into the csproj-derived model.
+
+    Adds sources Unity has not regenerated a csproj for yet, and synthesises
+    assemblies for brand-new .asmdefs by borrowing a sibling's reference set.
+    """
+    discovered, notes = discover_sources(project, ["Assets", "Packages"])
+    by_name = {a.name: a for a in assemblies}
+
+    for asm in assemblies:
+        if asm.source_scope() == "cache":
+            continue  # immutable package sources; the csproj is never stale there
+        found = discovered.get(asm.name, [])
+        known = set(asm.sources)
+        added = [f for f in found if f not in known]
+        if added:
+            asm.sources.extend(added)
+            asm.sources.sort()
+            asm.added_from_disk = len(added)
+
+    donors = ("Assembly-CSharp", "Assembly-CSharp-Editor")
+    for name, files in sorted(discovered.items()):
+        if name in by_name:
+            continue
+        editor = any("Editor" in f.relative_to(project).parts[:-1] for f in files)
+        donor = by_name.get(donors[1] if editor else donors[0]) or by_name.get(donors[0])
+        if donor is None:
+            notes.append(f"assembly {name} has no csproj and no donor to borrow references from")
+            continue
+        synth = Assembly(donor.csproj, project)
+        synth.name = name
+        synth.sources = sorted(files)
+        synth.declared_sources = [f.relative_to(project).as_posix() for f in files]
+        synth.missing_sources = []
+        synth.borrowed_from = donor.name
+        synth.added_from_disk = len(files)
+        assemblies.append(synth)
+        by_name[name] = synth
+        notes.append(
+            f"{name}: no csproj yet (new .asmdef?) — compiled with {donor.name}'s "
+            "reference set, which is a superset and may hide a missing asmdef reference"
+        )
+
+    return assemblies, notes
+
+
+# ---------------------------------------------------------------------------
+# On-disk assembly assignment
+#
+# The csproj files are authoritative for *references*, but they go stale the
+# moment a file is added outside the editor — which is precisely the situation
+# this tool exists for (agents writing code while Unity holds the lock). So
+# source membership is recomputed from disk using Unity's own rules:
+#
+#   1. nearest ancestor directory holding an .asmdef wins; its "name" is the
+#      assembly. An .asmref makes a directory join the assembly it points at.
+#   2. otherwise Assembly-CSharp, or Assembly-CSharp-Editor when any directory
+#      on the path is literally named "Editor".
+#   3. Assets/Plugins, Assets/Standard Assets and Assets/Pro Standard Assets are
+#      the legacy first-pass roots.
+#   4. directories that are hidden, end in "~", or are named "cvs" are ignored,
+#      as are Unity's own ignored roots.
+# ---------------------------------------------------------------------------
+
+FIRSTPASS_ROOTS = ("Plugins", "Standard Assets", "Pro Standard Assets")
+
+
+def _read_json(path: Path) -> dict:
+    import json
+
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {}
+
+
+def _skip_dir(name: str) -> bool:
+    return name.startswith(".") or name.endswith("~") or name.lower() == "cvs"
+
+
+def discover_sources(project: Path, roots: list[str]) -> tuple[dict[str, list[Path]], list[str]]:
+    notes: list[str] = []
+    asmdef_dirs: dict[Path, str] = {}
+    guid_to_name: dict[str, str] = {}
+    asmref_dirs: dict[Path, str] = {}
+    cs_files: list[Path] = []
+
+    for root_name in roots:
+        root = project / root_name
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not _skip_dir(d)]
+            d = Path(dirpath)
+            for fn in filenames:
+                if fn.endswith(".asmdef"):
+                    data = _read_json(d / fn)
+                    name = data.get("name") or Path(fn).stem
+                    asmdef_dirs[d] = name
+                    meta = d / (fn + ".meta")
+                    if meta.is_file():
+                        m = re.search(r"guid:\s*([0-9a-f]{32})",
+                                      meta.read_text(encoding="utf-8", errors="replace"))
+                        if m:
+                            guid_to_name[m.group(1)] = name
+                elif fn.endswith(".asmref"):
+                    ref = (_read_json(d / fn).get("reference") or "").strip()
+                    if ref:
+                        asmref_dirs[d] = ref
+                elif fn.endswith(".cs"):
+                    cs_files.append(d / fn)
+
+    # .asmref may point at a GUID. Package asmdefs live under Library/PackageCache,
+    # which we deliberately do not walk for sources — scan it for GUIDs only, and
+    # only if something is actually unresolved (~20 ms, ~330 files).
+    unresolved = [r[5:] for r in asmref_dirs.values()
+                  if r.startswith("GUID:") and r[5:] not in guid_to_name]
+    if unresolved:
+        cache = project / "Library" / "PackageCache"
+        for dirpath, dirnames, filenames in os.walk(cache):
+            dirnames[:] = [d for d in dirnames if not _skip_dir(d)]
+            for fn in filenames:
+                if not fn.endswith(".asmdef.meta"):
+                    continue
+                meta = Path(dirpath) / fn
+                m = re.search(r"guid:\s*([0-9a-f]{32})",
+                              meta.read_text(encoding="utf-8", errors="replace"))
+                if m and m.group(1) in unresolved:
+                    data = _read_json(meta.with_suffix(""))
+                    guid_to_name[m.group(1)] = data.get("name") or fn[: -len(".asmdef.meta")]
+
+    for d, ref in list(asmref_dirs.items()):
+        if ref.startswith("GUID:"):
+            name = guid_to_name.get(ref[5:])
+            if name:
+                asmdef_dirs[d] = name
+            else:
+                # Leave the directory to its enclosing .asmdef — the same
+                # fallback Unity would not use, but the safe one: it keeps the
+                # files inside a real assembly instead of leaking them into
+                # Assembly-CSharp.
+                notes.append(f"unresolved .asmref GUID in {d.relative_to(project)}")
+        else:
+            asmdef_dirs[d] = ref
+
+    out: dict[str, list[Path]] = {}
+    for f in cs_files:
+        owner = None
+        for parent in f.parents:
+            if parent in asmdef_dirs:
+                owner = asmdef_dirs[parent]
+                break
+            if parent == project:
+                break
+        if owner is None:
+            try:
+                rel = f.relative_to(project).parts
+            except ValueError:
+                continue
+            editor = "Editor" in rel[:-1]
+            firstpass = len(rel) > 2 and rel[0] == "Assets" and rel[1] in FIRSTPASS_ROOTS
+            if firstpass:
+                owner = "Assembly-CSharp-firstpass" + ("-Editor" if editor else "")
+            else:
+                owner = "Assembly-CSharp-Editor" if editor else "Assembly-CSharp"
+        out.setdefault(owner, []).append(f)
+
+    for v in out.values():
+        v.sort()
+    return out, notes
+
+
+def detect_unity_root(project: Path, assemblies: list[Assembly]) -> tuple[Path, "Path | None"]:
+    """Return (unity_root, root_recorded_in_csproj).
+
+    Primary source is the absolute HintPaths Unity itself wrote into the csproj —
+    that is the editor this project was last generated against, whatever version
+    it is. UNITY_ROOT overrides, and when it does we rewrite the recorded prefix
+    so an override actually takes effect on every reference.
+    """
+    recorded = None
+    for asm in assemblies:
+        for h in asm.hint_paths:
+            i = h.find("/Editor/Data/")
+            if i > 0:
+                recorded = Path(h[: i + len("/Editor")])
+                break
+        if recorded:
+            break
+
+    env = os.environ.get("UNITY_ROOT")
+    if env:
+        root = Path(env).resolve()
+        # Accept either .../Editor or .../Editor/Data
+        if root.name == "Data" and (root / "MonoBleedingEdge").is_dir():
+            root = root.parent
+        return root, recorded
+
+    if recorded and (recorded / "Data").is_dir():
+        return recorded, recorded
+
+    # Last resort: the version file plus the usual Hub layouts.
+    ver = ""
+    pv = project / "ProjectSettings" / "ProjectVersion.txt"
+    if pv.is_file():
+        m = re.search(r"m_EditorVersion:\s*(\S+)", pv.read_text(encoding="utf-8", errors="replace"))
+        if m:
+            ver = m.group(1)
+    if ver:
+        for base in (
+            Path.home() / "Unity/Hub/Editor",
+            Path("/opt/unity/editors"),
+            Path("/Applications/Unity/Hub/Editor"),
+        ):
+            cand = base / ver / "Editor"
+            if (cand / "Data").is_dir():
+                return cand, recorded
+    die(
+        "cannot locate the Unity editor. Set UNITY_ROOT to the directory that "
+        "contains Data/ (e.g. /path/to/Hub/Editor/6000.5.3f1/Editor)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reference resolution
+# ---------------------------------------------------------------------------
+
+
+def build_references(
+    asm: Assembly,
+    project: Path,
+    unity_root: Path,
+    recorded_root: "Path | None",
+    outdir: Path,
+    fresh: set[str],
+) -> tuple[list[Path], list[str]]:
+    """Exact per-assembly reference set: csproj HintPaths + resolved ProjectReferences.
+
+    Any reference that resolves to Library/ScriptAssemblies/<X>.dll for an X we
+    are compiling ourselves is redirected to our own fresh output. Without this,
+    an assembly that depends on one an agent just edited is type-checked against
+    Unity's last compile — which is exactly the stale state we are working around.
+    """
+    script_assemblies = project / "Library" / "ScriptAssemblies"
+    refs: list[Path] = []
+    warnings: list[str] = []
+    important: list[str] = []
+    seen: set[str] = set()
+
+    def add(p: Path, why: str) -> None:
+        # Redirect stale Unity output to this run's freshly built assembly —
+        # but only if we actually produced one. If a dependency failed to
+        # compile we fall back to Unity's prebuilt DLL, so its dependents still
+        # get checked (against older types) instead of cascading into silence.
+        if p.suffix == ".dll" and p.parent == script_assemblies and p.stem in fresh:
+            candidate = outdir / f"{p.stem}.dll"
+            if candidate.is_file():
+                p = candidate
+            else:
+                important.append(
+                    f"{p.stem} did not compile — fell back to Unity's prebuilt "
+                    f"{p.name}, so errors here may be stale"
+                )
+        rp = str(p)
+        if rp in seen:
+            return
+        if not p.is_file():
+            warnings.append(f"missing {why}: {p}")
+            return
+        seen.add(rp)
+        refs.append(p)
+
+    remap = recorded_root is not None and str(recorded_root) != str(unity_root)
+    for h in asm.hint_paths:
+        raw = h.replace("\\", "/")
+        if remap and raw.startswith(str(recorded_root) + "/"):
+            raw = str(unity_root) + raw[len(str(recorded_root)) :]
+        p = Path(raw)
+        add(p if p.is_absolute() else project / p, "reference")
+
+    # ProjectReference points at a sibling generated csproj, NOT a HintPath. Its
+    # build output is Unity's compiled DLL. Miss this and you lose every package
+    # assembly (Entities, Rukhanka, ...) — worth ~370 phantom errors on a DOTS
+    # project.
+    for name in asm.project_refs:
+        add(script_assemblies / f"{name}.dll", f"ProjectReference {name}")
+
+    return refs, warnings, important
+
+
+def dependency_waves(selected: list[Assembly], project: Path) -> tuple[list[list[Assembly]], dict[str, set[str]]]:
+    """Group assemblies into compile waves so dependencies are built first."""
+    names = {a.name for a in selected}
+    script_assemblies = project / "Library" / "ScriptAssemblies"
+    deps: dict[str, set[str]] = {}
+    for a in selected:
+        d = {n for n in a.project_refs if n in names and n != a.name}
+        for h in a.hint_paths:
+            p = Path(h.replace("\\", "/"))
+            if not p.is_absolute():
+                p = project / p
+            if p.parent == script_assemblies and p.stem in names and p.stem != a.name:
+                d.add(p.stem)
+        deps[a.name] = d
+
+    waves: list[list[Assembly]] = []
+    done: set[str] = set()
+    remaining = list(selected)
+    while remaining:
+        wave = [a for a in remaining if deps[a.name] <= done]
+        if not wave:
+            # Unity forbids assembly cycles, but a hand-edited or half-regenerated
+            # csproj can still produce one. Break it and say so rather than hang.
+            wave = list(remaining)
+            for a in wave:
+                deps[a.name] = set()
+        waves.append(wave)
+        done |= {a.name for a in wave}
+        remaining = [a for a in remaining if a not in wave]
+    return waves, deps
+
+
+# ---------------------------------------------------------------------------
+# Compile
+# ---------------------------------------------------------------------------
+
+
+class Result:
+    def __init__(self, asm: Assembly):
+        self.asm = asm
+        self.ok = False
+        self.seconds = 0.0
+        self.lines: list[str] = []
+        self.errors = 0
+        self.warnings = 0
+        self.ref_warnings: list[str] = []
+        self.important: list[str] = []
+
+
+def compile_assembly(
+    asm: Assembly,
+    project: Path,
+    unity_root: Path,
+    recorded_root: "Path | None",
+    outdir: Path,
+    mono: Path,
+    csc: Path,
+    suppress: bool,
+    verbose: bool,
+    fresh: set[str],
+) -> Result:
+    res = Result(asm)
+    refs, res.ref_warnings, res.important = build_references(
+        asm, project, unity_root, recorded_root, outdir, fresh
+    )
+
+    if not asm.sources:
+        res.ok = True
+        return res
+
+    args = [
+        "-nologo",
+        "-nostdlib+",
+        "-target:library",
+        f"-langversion:{asm.lang_version}",
+        "-unsafe+" if asm.unsafe else "-unsafe-",
+        f"-out:{outdir / (asm.name + '.dll')}",
+    ]
+    if asm.defines:
+        args.append("-define:" + ";".join(asm.defines))
+    nowarn = list(asm.nowarn)
+    if suppress:
+        nowarn += NOISE_WARNINGS
+    if nowarn:
+        args.append("-nowarn:" + ";".join(sorted(set(nowarn))))
+    args += [f"-r:{r}" for r in refs]
+    args += [str(s) for s in asm.sources]
+
+    # Response file: 400+ references and 250+ sources per assembly, many with
+    # spaces in the path ("JMO Assets"). csc's response-file quoting handles it
+    # and keeps us clear of any argv length limit.
+    rsp = outdir / f"{asm.name}.rsp"
+    with rsp.open("w", encoding="utf-8") as fh:
+        for a in args:
+            k, sep, v = a.partition(":")
+            if sep and (" " in v or "&" in v):
+                fh.write(f'{k}:"{v}"\n')
+            elif " " in a and not a.startswith("-"):
+                fh.write(f'"{a}"\n')
+            else:
+                fh.write(a + "\n")
+
+    # -noconfig must be on the command line: csc warns (CS2023) and ignores it
+    # when it appears inside a response file.
+    cmd = [str(mono), str(csc), "-noconfig", f"@{rsp}"]
+    if verbose:
+        res.lines.append("  $ " + " ".join(shlex.quote(c) for c in cmd))
+        res.lines.append(f"  {len(refs)} references, {len(asm.sources)} sources")
+
+    t0 = time.perf_counter()
+    proc = subprocess.run(
+        cmd,
+        cwd=str(project),
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    res.seconds = time.perf_counter() - t0
+
+    for line in (proc.stdout + proc.stderr).splitlines():
+        if not line.strip():
+            continue
+        m = DIAG_RE.search(line)
+        if m:
+            if m.group(1) == "error":
+                res.errors += 1
+            else:
+                res.warnings += 1
+        res.lines.append(line)
+
+    res.ok = proc.returncode == 0 and res.errors == 0
+    return res
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="unity-csccheck",
+        description="Offline, per-assembly C# compile check for a Unity project. "
+        "Never launches Unity, never takes Temp/UnityLockfile.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  unity-csccheck /path/to/UnityProject          check every assembly owned by the project
+  unity-csccheck                                 ... in (or above) the current directory
+  unity-csccheck . -a Game.Runtime               one assembly
+  unity-csccheck . Assets/Game/Foo.cs            the assembly that owns this file
+  unity-csccheck . --scope all                   include immutable PackageCache assemblies
+  unity-csccheck . --list                        show assemblies and where their sources live
+  UNITY_ROOT=/path/to/Editor unity-csccheck .    override editor location
+
+exit: 0 clean · 1 compile errors · 2 setup problem
+""",
+    )
+    ap.add_argument("target", nargs="*", default=[],
+                    help="project directory (optional) and/or .cs files to scope the check to")
+    ap.add_argument("-a", "--assembly", action="append", default=[],
+                    help="compile only this assembly (repeatable)")
+    ap.add_argument("--scope", choices=["assets", "project", "all"], default="assets",
+                    help="which assemblies to compile by default: assets = sources under "
+                         "Assets/ (default); project = also embedded Packages/; all = also "
+                         "Library/PackageCache/")
+    ap.add_argument("-j", "--jobs", type=int, default=min(8, os.cpu_count() or 4),
+                    help="parallel compiles (default: %(default)s)")
+    ap.add_argument("--list", action="store_true", help="list assemblies and exit")
+    ap.add_argument("--no-suppress", action="store_true",
+                    help="do not pass the known-noise -nowarn set (see NOISE_WARNINGS)")
+    ap.add_argument("-q", "--quiet", action="store_true", help="only print failures and the summary")
+    ap.add_argument("-v", "--verbose", action="store_true", help="show the csc invocation and reference counts")
+    ap.add_argument("--version", action="version", version=f"unity-csccheck {VERSION}")
+    args = ap.parse_args(argv)
+
+    proj_arg = None
+    files: list[Path] = []
+    for t in args.target:
+        p = Path(t)
+        if p.is_dir():
+            if proj_arg is not None:
+                die("more than one project directory given")
+            proj_arg = t
+        elif t.endswith(".cs"):
+            files.append(p.resolve())
+        else:
+            die(f"not a directory and not a .cs file: {t}")
+
+    project = find_project(proj_arg or (str(files[0].parent) if files else None))
+    assemblies = load_assemblies(project)
+    assemblies, disc_notes = merge_discovered(assemblies, project)
+
+    script_assemblies = project / "Library" / "ScriptAssemblies"
+    if not any(script_assemblies.glob("*.dll")):
+        die(
+            f"{script_assemblies} has no DLLs. That directory is where package "
+            "assemblies (InputSystem, HDRP, Entities, ...) come from. Open the "
+            "project in Unity once so it compiles, then re-run."
+        )
+
+    unity_root, recorded_root = detect_unity_root(project, assemblies)
+    data = unity_root / "Data"
+    mono = data / "MonoBleedingEdge" / "bin-linux64" / "mono"
+    if not mono.is_file():
+        for cand in ("bin/mono", "bin-osx64/mono", "bin/mono.exe"):
+            c = data / "MonoBleedingEdge" / cand
+            if c.is_file():
+                mono = c
+                break
+    csc = data / "MonoBleedingEdge" / "lib" / "mono" / "4.5" / "csc.exe"
+    if not mono.is_file():
+        die(f"mono not found under {data / 'MonoBleedingEdge'} (set UNITY_ROOT)")
+    if not csc.is_file():
+        die(f"csc.exe not found at {csc} (set UNITY_ROOT)")
+
+    if args.list:
+        print(f"{project}  ({len(assemblies)} assemblies)")
+        w = max(len(a.name) for a in assemblies)
+        for a in sorted(assemblies, key=lambda x: (x.source_scope(), x.name)):
+            kind = "editor" if a.is_editor_only() else "runtime"
+            tail = ""
+            if a.borrowed_from:
+                tail = f"  [no csproj, refs borrowed from {a.borrowed_from}]"
+            elif a.added_from_disk:
+                tail = f"  [+{a.added_from_disk} from disk, csproj is stale]"
+            print(f"  {a.name:<{w}}  {a.source_scope():<8} {kind:<7} "
+                  f"{len(a.sources):>4} files  {len(a.hint_paths):>3} refs  "
+                  f"{len(a.project_refs)} projrefs{tail}")
+        for n in disc_notes:
+            print(f"  ! {n}")
+        return 0
+
+    # -- selection ----------------------------------------------------------
+    scope_allowed = {"assets": {"assets"},
+                     "project": {"assets", "packages"},
+                     "all": {"assets", "packages", "cache"}}[args.scope]
+    selected = [a for a in assemblies if a.source_scope() in scope_allowed]
+
+    if args.assembly:
+        by_name = {a.name: a for a in assemblies}
+        selected = []
+        for n in args.assembly:
+            if n not in by_name:
+                die(f"no such assembly: {n} (try --list)")
+            selected.append(by_name[n])
+
+    if files:
+        owners, orphans = [], []
+        for f in files:
+            hit = [a for a in assemblies if f in a.sources]
+            if hit:
+                owners += hit
+            else:
+                orphans.append(f)
+        if orphans:
+            for o in orphans:
+                sys.stderr.write(f"unity-csccheck: no assembly owns {o} — is it in the project "
+                                 "and has Unity regenerated the csproj files?\n")
+            return 2
+        # Dedupe, preserving order. Whole owning assemblies are compiled: a
+        # single file cannot be type-checked without the rest of its assembly.
+        seen: set[str] = set()
+        selected = [a for a in owners if not (a.name in seen or seen.add(a.name))]
+
+    # An assembly whose every source has been deleted still has a csproj until
+    # Unity regenerates. Nothing to check, and its stale reference list is noise.
+    selected = [a for a in selected if a.sources]
+
+    if not selected:
+        die(f"nothing to compile at --scope {args.scope} (try --list)")
+
+    if not args.quiet:
+        print(f"unity-csccheck {VERSION}  ·  {project}")
+        print(f"  unity   {unity_root}")
+        print(f"  scope   {args.scope} — {len(selected)} of {len(assemblies)} assemblies, "
+              f"{sum(len(a.sources) for a in selected)} sources")
+        stale = sum(a.added_from_disk for a in selected if not a.borrowed_from)
+        if stale:
+            print(f"  note    {stale} source(s) found on disk but not in any csproj "
+                  "(Unity has not regenerated them) — included anyway")
+        for n in disc_notes:
+            print(f"  note    {n}")
+
+    # Nothing is written inside the project — output goes to a private temp dir.
+    outdir = Path(tempfile.mkdtemp(prefix="unity-csccheck-"))
+    waves, deps = dependency_waves(selected, project)
+    fresh = {a.name for a in selected}
+    results: list[Result] = []
+    built: set[str] = set()
+    t0 = time.perf_counter()
+    try:
+        for wave in waves:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
+                futures = [
+                    ex.submit(compile_assembly, a, project, unity_root, recorded_root,
+                              outdir, mono, csc, not args.no_suppress, args.verbose, fresh)
+                    for a in wave
+                ]
+                for f in concurrent.futures.as_completed(futures):
+                    r = f.result()
+                    results.append(r)
+                    if r.ok:
+                        built.add(r.asm.name)
+    finally:
+        shutil.rmtree(outdir, ignore_errors=True)
+
+    wall = time.perf_counter() - t0
+    results.sort(key=lambda r: (r.ok, r.asm.name))
+
+    width = max(len(r.asm.name) for r in results)
+    failed = [r for r in results if not r.ok]
+    total_warnings = sum(r.warnings for r in results)
+
+    print()
+    for r in results:
+        if r.ok and args.quiet:
+            continue
+        status = "OK  " if r.ok else "FAIL"
+        extra = f"  {r.warnings} warn" if r.warnings else ""
+        print(f"  {status}  {r.asm.name:<{width}}  {len(r.asm.sources):>4} files  "
+              f"{r.seconds:>5.2f}s{extra}")
+        # A reference the csproj lists but Unity has since pruned only matters if
+        # the compile actually failed; otherwise it is noise. Always countable.
+        for w in r.important:
+            print(f"          ! {w}")
+        if r.ref_warnings:
+            if r.ok and not args.verbose:
+                print(f"          ! {len(r.ref_warnings)} reference(s) in "
+                      f"{r.asm.csproj.name} do not exist on disk (-v to list)")
+            else:
+                for w in r.ref_warnings:
+                    print(f"          ! {w}")
+        if r.asm.missing_sources and args.verbose:
+            print(f"          ! {len(r.asm.missing_sources)} source(s) listed in "
+                  f"{r.asm.csproj.name} do not exist on disk (stale csproj)")
+        for line in r.lines:
+            if r.ok and not args.verbose and DIAG_RE.search(line) is None:
+                continue
+            print(f"        {line}")
+
+    print()
+    print(f"  {len(results)} assemblies · {len(results) - len(failed)} ok · "
+          f"{len(failed)} failed · "
+          f"{total_warnings} warnings · {wall:.1f}s")
+    if failed:
+        print("COMPILE FAILED: " + ", ".join(r.asm.name for r in failed))
+        return 1
+    print("COMPILE OK")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
