@@ -5,8 +5,8 @@ touches `Temp/UnityLockfile`** — so it works while the editor is open, during 
 in parallel with other agents writing files.
 
 ```
-$ unity-csccheck ~/Projects/synesthesiaintorainbows
-unity-csccheck 1.0.0  ·  /home/emre/Projects/synesthesiaintorainbows
+$ unity-csccheck ~/Projects/x
+unity-csccheck 1.0.0  ·  /home/emre/Projects/x
   unity   /home/emre/Unity/Hub/Editor/6000.5.3f1/Editor
   scope   assets — 5 of 5 assemblies, 57 sources
   note    42 source(s) found on disk but not in any csproj (Unity has not regenerated them) — included anyway
@@ -150,7 +150,7 @@ real failure. `--no-suppress` turns it off.
 
 | project | assemblies | sources | wall |
 |---|---|---|---|
-| `synesthesiaintorainbows` (HDRP, 3 asmdefs + Assembly-CSharp) | 5 | 57 | 3.6 s |
+| `synesthesia` (HDRP, 3 asmdefs + Assembly-CSharp) | 5 | 57 | 3.6 s |
 | `walkin` (DOTS: Entities 6.5, Rukhanka, CFXR) | 8 | 291 | 4.0 s |
 
 Both `COMPILE OK`, exit 0. Negative test in each — a real syntax error in a scratch file is
